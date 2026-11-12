@@ -1,8 +1,10 @@
 #pragma once
 
+#include "sbl/base_id.hpp"
 #include "sbl/request.hpp"
 
 #include <string>
+#include <vector>
 
 namespace sbl {
 
@@ -11,13 +13,12 @@ struct EvaluateFix {
     std::string transmitter_id;
     double height{0.0};
     bool has_height{false};
+    UsedBaseIds bases;
 };
 
-// 从 sbl.evaluate.v1 报文写入基站坐标和已使用的斜距。
-// stations 为 3 时按 receivers 顺序取前 3 条，为 2 时取前 2 条。
-// 接受 sbl.evaluate.v1 与 v2。双站的已知高度优先取结果里的 z。
-bool apply_evaluate_payload(const std::string& payload, SolveRequest& request, EvaluateFix& fix,
-                            std::string& error);
+// 从 sbl.evaluate.v1 或 v2 取出本轮基站、斜距和高度。不按数组顺序填 A、B、C。
+bool read_evaluate(const std::string& payload, SolveRequest& request, EvaluateFix& fix,
+                   std::vector<LayoutReceiver>& receivers, std::string& error);
 
 class MqttSubscriber {
 public:

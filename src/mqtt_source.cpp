@@ -50,23 +50,52 @@ const Json::Value* find_result(const Json::Value& root, std::string& error) {
         error = "报文没有 results";
         return nullptr;
     }
-    const Json::Value* fallback = nullptr;
+    const Json::Value* ok_robot = nullptr;
+    const Json::Value* ok_any = nullptr;
+    const Json::Value* robot_with_ranges = nullptr;
     for (const Json::Value& item : results) {
-        if (!item.isObject() || !item.get("ok", false).asBool()) {
+        if (!item.isObject()) {
             continue;
         }
-        if (fallback == nullptr) {
-            fallback = &item;
+        const bool ok = item.get("ok", false).asBool();
+        const bool is_robot = item.get("role", "").asString() == "robot";
+        if (ok && is_robot && ok_robot == nullptr) {
+            ok_robot = &item;
+        } else if (ok && ok_any == nullptr) {
+            ok_any = &item;
         }
-        if (item.get("role", "").asString() == "robot") {
-            return &item;
+        if (is_robot && robot_with_ranges == nullptr && item["ranges"].isArray()) {
+            robot_with_ranges = &item;
         }
     }
-    if (fallback == nullptr) {
-        error = "报文中没有成功的定位结果";
-        return nullptr;
+    if (ok_robot != nullptr) {
+        return ok_robot;
     }
-    return fallback;
+    if (ok_any != nullptr) {
+        return ok_any;
+    }
+    // 评估端的 ok 只表示它自己的误差解算成功。三维模式只有两座站时会标失败，斜距仍可给双站用。
+    if (robot_with_ranges != nullptr) {
+        return robot_with_ranges;
+    }
+    error = "报文中没有成功的定位结果";
+    return nullptr;
+}
+
+bool read_base_id(const Json::Value& node, int& base_id, bool& has_base_id, std::string& error) {
+    has_base_id = false;
+    base_id = 0;
+    if (!node.isObject() || !node.isMember("base_id") || node["base_id"].isNull()) {
+        return true;
+    }
+    const Json::Value& value = node["base_id"];
+    if (!value.isInt() || value.asInt() <= 0) {
+        error = "base_id 无效";
+        return false;
+    }
+    base_id = value.asInt();
+    has_base_id = true;
+    return true;
 }
 
 }  // namespace
@@ -92,6 +121,10 @@ bool MqttSubscriber::send_all(const unsigned char* data, std::size_t size, std::
 
 bool MqttSubscriber::connect(const std::string& host, int port, const std::string& client_id,
                              std::string& error) {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -257,8 +290,8 @@ bool MqttSubscriber::read_publish(std::string& topic, std::string& payload, std:
     }
 }
 
-bool apply_evaluate_payload(const std::string& payload, SolveRequest& request, EvaluateFix& fix,
-                            std::string& error) {
+bool read_evaluate(const std::string& payload, SolveRequest& request, EvaluateFix& fix,
+                   std::vector<LayoutReceiver>& receivers, std::string& error) {
     Json::CharReaderBuilder builder;
     builder["collectComments"] = false;
     Json::Value root;
@@ -310,7 +343,12 @@ bool apply_evaluate_payload(const std::string& payload, SolveRequest& request, E
         request.slant_range.set_mobile_height(fix.height);
     }
 
-    std::vector<std::pair<std::string, double>> ranges;
+    struct SeenRange {
+        double range_m{0.0};
+        int base_id{0};
+        bool has_base_id{false};
+    };
+    std::vector<std::pair<std::string, SeenRange>> ranges;
     const Json::Value& range_rows = (*result)["ranges"];
     if (!range_rows.isArray()) {
         error = "结果缺少 ranges";
@@ -324,50 +362,53 @@ bool apply_evaluate_payload(const std::string& payload, SolveRequest& request, E
             error = "斜距字段无效";
             return false;
         }
-        ranges.emplace_back(row["receiver_id"].asString(), row["range_m"].asDouble());
+        SeenRange seen;
+        seen.range_m = row["range_m"].asDouble();
+        if (!read_base_id(row, seen.base_id, seen.has_base_id, error)) {
+            return false;
+        }
+        ranges.emplace_back(row["receiver_id"].asString(), seen);
     }
 
-    const Json::Value& receivers = root["layout"]["receivers"];
-    if (!receivers.isArray()) {
+    const Json::Value& receiver_rows = root["layout"]["receivers"];
+    if (!receiver_rows.isArray()) {
         error = "报文缺少 layout.receivers";
         return false;
     }
-    struct Station {
-        Vec3 position;
-        double range{0.0};
-    };
-    std::vector<Station> stations;
-    for (const Json::Value& receiver : receivers) {
-        const std::string id = receiver.get("id", "").asString();
-        const auto found = std::find_if(ranges.begin(), ranges.end(),
-                                         [&](const std::pair<std::string, double>& item) { return item.first == id; });
-        if (found == ranges.end()) {
-            continue;
-        }
-        if (!receiver["x"].isNumeric() || !receiver["y"].isNumeric() || !receiver["z"].isNumeric()) {
-            error = "基站 " + id + " 坐标无效";
+    receivers.clear();
+    for (const Json::Value& receiver : receiver_rows) {
+        LayoutReceiver item;
+        item.receiver_id = receiver.get("id", "").asString();
+        item.name = receiver.get("name", "").asString();
+        if (item.receiver_id.empty()) {
+            error = "基站缺少 id";
             return false;
         }
-        stations.push_back(Station{Vec3{receiver["x"].asDouble(), receiver["y"].asDouble(), receiver["z"].asDouble()},
-                                   found->second});
-    }
-
-    const int need = request.stations == StationCount::Three ? 3 : 2;
-    if (static_cast<int>(stations.size()) < need) {
-        error = "已使用的直视斜距只有 " + std::to_string(stations.size()) + " 条，需要 " + std::to_string(need);
-        return false;
-    }
-    request.triangulation.set_base_a(stations[0].position);
-    request.slant_range.set_base_a(stations[0].position);
-    request.triangulation.set_slant_range_a(stations[0].range);
-    request.slant_range.set_slant_range_a(stations[0].range);
-    request.triangulation.set_base_b(stations[1].position);
-    request.slant_range.set_base_b(stations[1].position);
-    request.triangulation.set_slant_range_b(stations[1].range);
-    request.slant_range.set_slant_range_b(stations[1].range);
-    if (need == 3) {
-        request.triangulation.set_base_c(stations[2].position);
-        request.triangulation.set_slant_range_c(stations[2].range);
+        if (!read_base_id(receiver, item.base_id, item.has_base_id, error)) {
+            return false;
+        }
+        const auto found = std::find_if(ranges.begin(), ranges.end(),
+                                         [&](const std::pair<std::string, SeenRange>& range) {
+                                             return range.first == item.receiver_id;
+                                         });
+        if (found != ranges.end()) {
+            if (!receiver["x"].isNumeric() || !receiver["y"].isNumeric() || !receiver["z"].isNumeric()) {
+                error = "基站 " + item.receiver_id + " 坐标无效";
+                return false;
+            }
+            if (found->second.has_base_id) {
+                if (item.has_base_id && item.base_id != found->second.base_id) {
+                    error = "基站 " + item.receiver_id + " 的站号不一致";
+                    return false;
+                }
+                item.base_id = found->second.base_id;
+                item.has_base_id = true;
+            }
+            item.position = Vec3{receiver["x"].asDouble(), receiver["y"].asDouble(), receiver["z"].asDouble()};
+            item.range = found->second.range_m;
+            item.has_range = true;
+        }
+        receivers.push_back(item);
     }
     return true;
 }

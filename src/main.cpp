@@ -1,13 +1,16 @@
+#include "sbl/base_id.hpp"
 #include "sbl/mqtt_source.hpp"
 #include "sbl/request.hpp"
 #include "sbl/uncertainty.hpp"
 
 #include <json/json.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -36,10 +39,19 @@ std::string solve_and_report(const sbl::SolveRequest& request, const sbl::Evalua
     std::cout.setf(std::ios::fixed);
     std::cout.precision(6);
 
+    Json::Value base_ids(Json::arrayValue);
+    std::cout << "base_ids:";
+    for (int id : fix.bases.id) {
+        base_ids.append(id);
+        std::cout << ' ' << id;
+    }
+    std::cout << '\n';
+
     Json::Value message;
     message["schema"] = "sbl.position.v1";
     message["seq"] = fix.seq;
     message["transmitter_id"] = fix.transmitter_id;
+    message["base_ids"] = base_ids;
     message["algorithm"] = sbl::algorithm_name(request.stations);
     message["status"] = sbl::status_name(result.status);
     message["message"] = result.message;
@@ -119,13 +131,19 @@ int main(int argc, char** argv) {
     if (port_text != nullptr && port_text[0] != '\0') {
         port = std::atoi(port_text);
     }
-    sbl::MqttSubscriber subscriber;
-    if (!subscriber.connect(host, port, "sbl-position", error) ||
-        !subscriber.subscribe("sbl/evaluate", error)) {
+    sbl::BaseRegistry registry("config/base_ids.conf");
+    if (!registry.load(error)) {
         std::cerr << error << '\n';
         return 2;
     }
-    std::cout << "mqtt: " << host << ':' << port << " subscribe sbl/evaluate publish sbl/position\n";
+    sbl::MqttSubscriber subscriber;
+    while (!subscriber.connect(host, port, "sbl-position", error) ||
+           !subscriber.subscribe("sbl/evaluate", error) || !subscriber.subscribe("sbl/base/ack", error)) {
+        std::cerr << error << "，2 秒后重试\n";
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    std::cout << "mqtt: " << host << ':' << port
+              << " subscribe sbl/evaluate sbl/base/ack publish sbl/position sbl/base/assign\n";
 
     for (;;) {
         std::string topic;
@@ -134,8 +152,45 @@ int main(int argc, char** argv) {
             std::cerr << error << '\n';
             return 2;
         }
+        if (topic == "sbl/base/ack") {
+            std::string summary;
+            if (!registry.apply_ack(payload, summary, error)) {
+                std::cerr << error << '\n';
+                continue;
+            }
+            if (!summary.empty()) {
+                std::cout << summary << '\n';
+            }
+            continue;
+        }
+        if (topic != "sbl/evaluate") {
+            continue;
+        }
         sbl::EvaluateFix fix;
-        if (!sbl::apply_evaluate_payload(payload, request, fix, error)) {
+        std::vector<sbl::LayoutReceiver> receivers;
+        if (!sbl::read_evaluate(payload, request, fix, receivers, error)) {
+            std::cerr << "seq " << fix.seq << ": " << error << '\n';
+            continue;
+        }
+        std::vector<sbl::AssignRequest> pending;
+        if (!registry.observe(receivers, pending, error)) {
+            std::cerr << error << '\n';
+            continue;
+        }
+        bool publish_failed = false;
+        for (const sbl::AssignRequest& assign : pending) {
+            if (!subscriber.publish("sbl/base/assign", sbl::assign_message(assign), error)) {
+                std::cerr << error << '\n';
+                publish_failed = true;
+                break;
+            }
+            std::cout << "published: sbl/base/assign base_id " << assign.base_id << " receiver "
+                      << assign.receiver_id << '\n';
+        }
+        if (publish_failed) {
+            return 2;
+        }
+        if (!sbl::apply_confirmed_bases(registry, receivers, request, fix.bases, error)) {
             std::cerr << "seq " << fix.seq << ": " << error << '\n';
             continue;
         }

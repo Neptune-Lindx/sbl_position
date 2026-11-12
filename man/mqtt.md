@@ -1,6 +1,6 @@
 # 定位程序的 MQTT
 
-`sbl_position_demo` 做两件事：订阅评估程序的 `sbl/evaluate`，解算后把终端上的定位结果发到 `sbl/position`。
+`sbl_position_demo` 做两件事：订阅评估程序的 `sbl/evaluate`，解算后把终端上的定位结果发到 `sbl/position`。基站站号的分配和应答见 [base_id.md](base_id.md)。
 
 坐标与评估程序一致：**+X 右舷、+Y 船艏、+Z 向上**，单位米。
 
@@ -13,9 +13,9 @@
 | 客户端 ID | `sbl-position` |
 | Clean session | true |
 | Keepalive | 60 s |
-| 订阅 | `sbl/evaluate`，QoS 0 |
-| 发布 | `sbl/position`，QoS 0，不保留 |
-| 行为 | 连上后一直收。每解算一条就发一条。断线后进程退出，退出码 2 |
+| 订阅 | `sbl/evaluate`、`sbl/base/ack`，QoS 0 |
+| 发布 | `sbl/position`、`sbl/base/assign`，QoS 0，不保留 |
+| 行为 | Broker 未就绪时每 2 秒重试，直到连上。连上后一直收，每解算一条就发一条。收发中途断线后进程退出，退出码 2 |
 
 评估程序大约每秒重复最近一次评估。接收端对每一条都解算并转发，`seq` 沿用评估报文的序号。
 
@@ -31,13 +31,13 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
 
 基站和斜距的对应关系：
 
-1. 在 `results` 里取 `ok` 为 true、且 `role` 为 `robot` 的那一条。没有 `robot` 时用第一条成功结果。
+1. 在 `results` 里优先取 `ok` 为 true、且 `role` 为 `robot` 的那一条。没有成功的 `robot` 时用第一条成功结果。评估端自己解算失败但机器人结果里仍有 `ranges` 时，也用这一条。三维模式只有两座站时会把 `ok` 标成 false，双站仍用其中的斜距和 `z`。
 2. 这条结果的 `ranges` 里，只保留 `used` 和 `los` 都为 true 的斜距。`range_m` 是几何斜距，米。
-3. 用 `receiver_id` 到 `layout.receivers` 里找 Type A 的 `x`、`y`、`z`。
-4. 顺序沿用 `layout.receivers` 的数组顺序，跳过没有可用斜距的站。
+3. 用 `receiver_id` 到 `layout.receivers` 里找 Type A 的 `x`、`y`、`z`。站址和斜距上的整数 `base_id` 一并读入。还没分到号时没有这个字段。同一座站两处都有时必须相同。
+4. 解算用的站按已完成的站号，不按数组顺序。编号见 [base_id.md](base_id.md)。报文里的 `base_id` 必须和编号表一致。
 5. `stations 2` 时取已知高度，单位米。`sbl.evaluate.v2` 把机器人的 x、y 留在发布端，高度在该条结果的 `z`，`layout.transmitters` 里同一信标也只有 `z`。接收端先用结果的 `z`，没有再用信标的 `z`，再没有才用 `position` 的第三个数。
 
-`stations 3` 取前 3 座，写入 A、B、C。`stations 2` 取前 2 座，写入 A、B。条数不够，或双站时没有高度，就跳过这一条报文，继续等下一条，这时不发 `sbl/position`。
+`stations 3` 用已完成的 1、2、3 号。`stations 2` 在已完成的站里找坐标不是全 0、斜距不是 0 的站，取 Y 坐标之差的绝对值最大的两座。有效站不足两座、三站缺号，或双站时没有高度，就跳过这一条报文的定位发布，继续等下一条。
 
 双站先在终端打出 `height`，它就是报文里的已知高度，解算位置的 z 与它相同。三站的 `height` 是交点解出的 z。
 
@@ -52,7 +52,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
 
 评估报文里的 `layout.mode`、`sigma_r`、`type_a_site_sigma` 和 `results[].sigma` 不参与这次解算。发射信标的 x、y 仍是评估真值，不当作定位结果；只有它的 z 在双站时当作已知高度。
 
-`stations 2` 时按 `layout.receivers` 顺序只用前 2 座已使用的直视站。`stations 3` 再用第 3 座。`occluded_links` 不单独读。被挡住的斜距在 `ranges` 里已经是 `los: false` 或 `used: false`，接收端会丢掉。
+`stations 3` 固定用已完成的 1、2、3 号。`stations 2` 每条报文重新选择 Y 差最大的两座有效站，站号较小的作为 A。`occluded_links` 不单独读。被挡住的斜距在 `ranges` 里已经是 `los: false` 或 `used: false`，接收端会丢掉，这座站本轮就不算有效。
 
 ## 定位结果发布
 
@@ -66,6 +66,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
   "seq": 116,
   "transmitter_id": "tx-1",
   "algorithm": "slant_range",
+  "base_ids": [1, 2, 0, 0],
   "status": "ok",
   "message": "selected the left solution",
   "solutions": 1,
@@ -88,6 +89,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
 | `seq` | int | 沿用所收评估报文的 `seq` |
 | `transmitter_id` | string | 这次解算的发射信标 |
 | `algorithm` | string | `triangulation` 或 `slant_range` |
+| `base_ids` | array | 固定 4 个整数，是这次解算用到的指定站号，按 A、B、C 的顺序放在前面，没用到的位置填 `0`。双站只有前两位，A 是这对站里站号较小的一座。三站为 `[1, 2, 3, 0]`。这里是编号表里的 `base_id`，不是 `rx-1` 这种 `receiver_id` |
 | `status` | string | `ok`、`invalid_input`、`no_solution` 等，与终端 `status` 相同 |
 | `message` | string | 与终端 `message` 相同 |
 | `solutions` | int | 输出的位置个数。正常为 1 |

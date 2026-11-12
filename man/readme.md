@@ -31,8 +31,8 @@ cmake --build build --target sbl_range_check
 
 | `stations` | 算法 | 配置里还需要 | MQTT 提供 |
 |---|---|---|---|
-| `3` | 三站斜距三角定位 | `height_select` | 前 3 座已使用的 Type A 坐标和斜距 |
-| `2` | 双站斜距加已知高度 | `side_select` | 前 2 座已使用的 Type A 坐标和斜距，以及发射信标的 z |
+| `3` | 三站斜距三角定位 | `height_select` | 已完成站号 1、2、3 的坐标和斜距 |
+| `2` | 双站斜距加已知高度 | `side_select` | 两座有效已完成站的坐标和斜距，以及发射信标的 z |
 
 `height_select` 取 `higher` 或 `lower`。`side_select` 取 `left` 或 `right`，`left` 是水平面内沿 A→B 的左侧。另一种算法用到的配置项可以留在文件里，程序只读取当前 `stations` 需要的项。基站坐标和斜距不写在配置里，见 [mqtt.md](mqtt.md)。
 
@@ -45,7 +45,7 @@ cmake --build build --target sbl_range_check
 ./build/sbl_position_demo config/triangulation.conf
 ```
 
-程序连上 Broker 后一直等待报文。每收到一条可用的评估结果，就用其中的基站、斜距和高度解算一次，在终端打印，并按 `sbl.position.v1` 发到主题 `sbl/position`。地址可用环境变量 `MQTT_HOST`、`MQTT_PORT` 修改。字段见 [mqtt.md](mqtt.md)。
+程序连上 Broker 后一直等待报文。基站站号见 [base_id.md](base_id.md)。三站用已完成的 1、2、3 号。双站每条报文在已完成的站里取 Y 坐标之差绝对值最大的两座有效站，站号较小的作为 A。有效站不足，或所需站号还没确认时，不发定位结果。可以解算时，用其中的斜距和高度解算一次，在终端打印，并按 `sbl.position.v1` 发到主题 `sbl/position`。地址可用环境变量 `MQTT_HOST`、`MQTT_PORT` 修改。字段见 [mqtt.md](mqtt.md)。
 
 `stations 3` 时按 `height_select` 输出一个位置，并单独打出解出的 `height`。`stations 2` 时流动站高度用报文里对应发射信标的 `z`，先打出这个 `height`，再按 `side_select` 输出基线一侧的一个位置。
 
@@ -58,7 +58,7 @@ cmake --build build --target sbl_range_check
 
 程序同时输出两种结果。`max_error_x/y/z` 是端点组合后最大值与最小值之差的绝对值。`sigma_x/y/z` 是标称位置处线性化协方差的 1σ。三站输出 x、y、z。双站只输出 x、y。计算思想见 [triangulation.md](triangulation.md) 的「定位误差评估」。
 
-配置打不开、缺项、数值无法解析，或连不上 Broker 时退出码为 2。单条报文无法解算时打印错误并继续等待下一条。
+配置打不开、缺项或数值无法解析时退出码为 2。Broker 还没起来时每 2 秒重试，不退出。单条报文无法解算时打印错误并继续等待下一条。收发中途断线后退出码为 2。
 
 ## 运行斜距核对
 
