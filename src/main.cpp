@@ -1,6 +1,7 @@
 #include "sbl/base_id.hpp"
 #include "sbl/mqtt_source.hpp"
 #include "sbl/request.hpp"
+#include "sbl/rod.hpp"
 #include "sbl/uncertainty.hpp"
 
 #include <json/json.h>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -111,6 +113,37 @@ std::string solve_and_report(const sbl::SolveRequest& request, const sbl::Evalua
     return compact_json(message);
 }
 
+constexpr const char* kRodStations[] = {"rx-1", "rx-3"};
+
+bool is_rod_station(const std::string& id) {
+    return id == "rx-1" || id == "rx-3";
+}
+
+const sbl::RodReading* find_rod(const std::vector<sbl::RodReading>& rods, const std::string& id) {
+    for (const sbl::RodReading& rod : rods) {
+        if (rod.id == id) {
+            return &rod;
+        }
+    }
+    return nullptr;
+}
+
+void apply_rod_positions(std::vector<sbl::LayoutReceiver>& receivers, const std::vector<sbl::RodReading>& rods) {
+    for (sbl::LayoutReceiver& receiver : receivers) {
+        if (!is_rod_station(receiver.receiver_id)) {
+            continue;
+        }
+        receiver.position = {};
+        receiver.has_position = false;
+        const sbl::RodReading* rod = find_rod(rods, receiver.receiver_id);
+        if (rod == nullptr || !rod->has_surface || !rod->has_solved) {
+            continue;
+        }
+        receiver.position = sbl::underwater_from_surface(*rod);
+        receiver.has_position = true;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -137,20 +170,27 @@ int main(int argc, char** argv) {
         return 2;
     }
     sbl::MqttSubscriber subscriber;
-    while (!subscriber.connect(host, port, "sbl-position", error) ||
-           !subscriber.subscribe("sbl/evaluate", error) || !subscriber.subscribe("sbl/base/ack", error)) {
-        std::cerr << error << "，2 秒后重试\n";
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-    std::cout << "mqtt: " << host << ':' << port
-              << " subscribe sbl/evaluate sbl/base/ack publish sbl/position sbl/base/assign\n";
+    const auto connect_mqtt = [&]() {
+        while (!subscriber.connect(host, port, "sbl-position", error) ||
+               !subscriber.subscribe("sbl/evaluate", error) || !subscriber.subscribe("sbl/base/ack", error) ||
+               !subscriber.subscribe("sbl/rod", error)) {
+            std::cerr << error << "，2 秒后重试\n";
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        std::cout << "mqtt: " << host << ':' << port
+                  << " subscribe sbl/evaluate sbl/base/ack sbl/rod"
+                  << " publish sbl/position sbl/base/assign sbl/rod/position\n";
+    };
+    connect_mqtt();
+    std::vector<sbl::RodReading> latest_rods;
 
     for (;;) {
         std::string topic;
         std::string payload;
         if (!subscriber.read_publish(topic, payload, error)) {
-            std::cerr << error << '\n';
-            return 2;
+            std::cerr << error << "，2 秒后重试\n";
+            connect_mqtt();
+            continue;
         }
         if (topic == "sbl/base/ack") {
             std::string summary;
@@ -163,6 +203,35 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (topic == "sbl/rod") {
+            int rod_seq = 0;
+            if (!sbl::read_rods(payload, rod_seq, latest_rods, error)) {
+                std::cerr << "rod seq " << rod_seq << ": " << error << '\n';
+                continue;
+            }
+            std::string rod_payload;
+            if (!sbl::rod_position_message(rod_seq, latest_rods, rod_payload)) {
+                continue;
+            }
+            if (!subscriber.publish("sbl/rod/position", rod_payload, error)) {
+                std::cerr << error << "，2 秒后重试\n";
+                connect_mqtt();
+                continue;
+            }
+            std::cout.setf(std::ios::fixed);
+            std::cout.precision(6);
+            std::cout << "published: sbl/rod/position seq " << rod_seq;
+            for (const char* id : kRodStations) {
+                const sbl::RodReading* rod = find_rod(latest_rods, id);
+                if (rod == nullptr || !rod->has_surface || !rod->has_solved) {
+                    continue;
+                }
+                const sbl::Vec3 point = sbl::underwater_from_surface(*rod);
+                std::cout << ' ' << id << ' ' << point.x << ' ' << point.y << ' ' << point.z;
+            }
+            std::cout << '\n';
+            continue;
+        }
         if (topic != "sbl/evaluate") {
             continue;
         }
@@ -172,6 +241,7 @@ int main(int argc, char** argv) {
             std::cerr << "seq " << fix.seq << ": " << error << '\n';
             continue;
         }
+        apply_rod_positions(receivers, latest_rods);
         std::vector<sbl::AssignRequest> pending;
         if (!registry.observe(receivers, pending, error)) {
             std::cerr << error << '\n';
@@ -180,7 +250,7 @@ int main(int argc, char** argv) {
         bool publish_failed = false;
         for (const sbl::AssignRequest& assign : pending) {
             if (!subscriber.publish("sbl/base/assign", sbl::assign_message(assign), error)) {
-                std::cerr << error << '\n';
+                std::cerr << error << "，2 秒后重试\n";
                 publish_failed = true;
                 break;
             }
@@ -188,7 +258,8 @@ int main(int argc, char** argv) {
                       << assign.receiver_id << '\n';
         }
         if (publish_failed) {
-            return 2;
+            connect_mqtt();
+            continue;
         }
         if (!sbl::apply_confirmed_bases(registry, receivers, request, fix.bases, error)) {
             std::cerr << "seq " << fix.seq << ": " << error << '\n';
@@ -202,8 +273,9 @@ int main(int argc, char** argv) {
         }
         const std::string outbound = solve_and_report(request, fix);
         if (!subscriber.publish("sbl/position", outbound, error)) {
-            std::cerr << error << '\n';
-            return 2;
+            std::cerr << error << "，2 秒后重试\n";
+            connect_mqtt();
+            continue;
         }
         std::cout << "published: sbl/position seq " << fix.seq << '\n';
     }

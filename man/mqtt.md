@@ -13,9 +13,9 @@
 | 客户端 ID | `sbl-position` |
 | Clean session | true |
 | Keepalive | 60 s |
-| 订阅 | `sbl/evaluate`、`sbl/base/ack`，QoS 0 |
-| 发布 | `sbl/position`、`sbl/base/assign`，QoS 0，不保留 |
-| 行为 | Broker 未就绪时每 2 秒重试，直到连上。连上后一直收，每解算一条就发一条。收发中途断线后进程退出，退出码 2 |
+| 订阅 | `sbl/evaluate`、`sbl/base/ack`、`sbl/rod`，QoS 0 |
+| 发布 | `sbl/position`、`sbl/base/assign`、`sbl/rod/position`，QoS 0，不保留 |
+| 行为 | Broker 未就绪或收发中途断开时，每 2 秒重试，直到重新连上并完成订阅。连上后一直收，每解算一条就发一条。进程不因断线退出 |
 
 评估程序大约每秒重复最近一次评估。接收端对每一条都解算并转发，`seq` 沿用评估报文的序号。
 
@@ -33,7 +33,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
 
 1. 在 `results` 里优先取 `ok` 为 true、且 `role` 为 `robot` 的那一条。没有成功的 `robot` 时用第一条成功结果。评估端自己解算失败但机器人结果里仍有 `ranges` 时，也用这一条。三维模式只有两座站时会把 `ok` 标成 false，双站仍用其中的斜距和 `z`。
 2. 这条结果的 `ranges` 里，只保留 `used` 和 `los` 都为 true 的斜距。`range_m` 是几何斜距，米。
-3. 用 `receiver_id` 到 `layout.receivers` 里找 Type A 的 `x`、`y`、`z`。站址和斜距上的整数 `base_id` 一并读入。还没分到号时没有这个字段。同一座站两处都有时必须相同。
+3. 用 `receiver_id` 到 `layout.receivers` 里找 Type A 的坐标和整数 `base_id`。`rx-1`、`rx-3` 不读报文里的 `x`、`y`、`z`，站址由连杆反推。其余站仍用报文坐标。还没分到号时没有 `base_id`。同一座站两处都有时必须相同。
 4. 解算用的站按已完成的站号，不按数组顺序。编号见 [base_id.md](base_id.md)。报文里的 `base_id` 必须和编号表一致。
 5. `stations 2` 时取已知高度，单位米。`sbl.evaluate.v2` 把机器人的 x、y 留在发布端，高度在该条结果的 `z`，`layout.transmitters` 里同一信标也只有 `z`。接收端先用结果的 `z`，没有再用信标的 `z`，再没有才用 `position` 的第三个数。
 
@@ -53,6 +53,35 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/position -V mqttv311
 评估报文里的 `layout.mode`、`sigma_r`、`type_a_site_sigma` 和 `results[].sigma` 不参与这次解算。发射信标的 x、y 仍是评估真值，不当作定位结果；只有它的 z 在双站时当作已知高度。
 
 `stations 3` 固定用已完成的 1、2、3 号。`stations 2` 每条报文重新选择 Y 差最大的两座有效站，站号较小的作为 A。`occluded_links` 不单独读。被挡住的斜距在 `ranges` 里已经是 `los: false` 或 `used: false`，接收端会丢掉，这座站本轮就不算有效。
+
+## 连杆反推站址
+
+另订阅 `sbl/rod`（`sbl.rod.v1`）。`rx-1` 和 `rx-3` 的站址不取 `sbl/evaluate` 里的坐标。杆臂在杆体系是 `(0, 0, -杆长)`，转到船体坐标后从出水端指向水下端。水下端等于出水端加上这个杆臂。姿态用报文里的解算角：航向 `yaw_deg`、俯仰 `pitch_deg`、横滚 `roll_deg`，单位度。航向 0° 沿船艏，正角度向右舷。
+
+出水端或姿态为 null 时，这座站本轮没有站址，不参与定位。反推出的位置用于这两座站的定位解算，并发到 `sbl/rod/position`。
+
+主题 `sbl/rod/position`。`schema` 固定为 `sbl.rod_position.v1`。`seq` 沿用所收 `sbl/rod` 的序号。只带已经反推出来的站。键的先后不参与判读。
+
+```json
+{
+  "schema": "sbl.rod_position.v1",
+  "seq": 1,
+  "bases": [
+    { "id": "rx-1", "x": 42.0, "y": -15.0, "z": 13.0 },
+    { "id": "rx-3", "x": 42.0, "y": 15.0, "z": 13.0 }
+  ]
+}
+```
+
+```text
+mosquitto_sub -h 127.0.0.1 -p 1883 -t sbl/rod/position -V mqttv311
+```
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `schema` | string | 固定 `sbl.rod_position.v1` |
+| `seq` | int | 沿用 `sbl/rod` 的 `seq` |
+| `bases[]` | array | 反推出的水下端。`id` 为 `rx-1` 或 `rx-3`，`x`、`y`、`z` 单位米 |
 
 ## 定位结果发布
 

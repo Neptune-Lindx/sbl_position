@@ -387,12 +387,17 @@ bool read_evaluate(const std::string& payload, SolveRequest& request, EvaluateFi
         if (!read_base_id(receiver, item.base_id, item.has_base_id, error)) {
             return false;
         }
+        const bool from_rod = item.receiver_id == "rx-1" || item.receiver_id == "rx-3";
+        if (!from_rod && receiver["x"].isNumeric() && receiver["y"].isNumeric() && receiver["z"].isNumeric()) {
+            item.position = Vec3{receiver["x"].asDouble(), receiver["y"].asDouble(), receiver["z"].asDouble()};
+            item.has_position = true;
+        }
         const auto found = std::find_if(ranges.begin(), ranges.end(),
                                          [&](const std::pair<std::string, SeenRange>& range) {
                                              return range.first == item.receiver_id;
                                          });
         if (found != ranges.end()) {
-            if (!receiver["x"].isNumeric() || !receiver["y"].isNumeric() || !receiver["z"].isNumeric()) {
+            if (!from_rod && !item.has_position) {
                 error = "基站 " + item.receiver_id + " 坐标无效";
                 return false;
             }
@@ -404,7 +409,6 @@ bool read_evaluate(const std::string& payload, SolveRequest& request, EvaluateFi
                 item.base_id = found->second.base_id;
                 item.has_base_id = true;
             }
-            item.position = Vec3{receiver["x"].asDouble(), receiver["y"].asDouble(), receiver["z"].asDouble()};
             item.range = found->second.range_m;
             item.has_range = true;
         }

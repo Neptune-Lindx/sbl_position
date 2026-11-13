@@ -14,6 +14,7 @@ struct LayoutReceiver {
     int base_id{0};
     bool has_base_id{false};
     Vec3 position{};
+    bool has_position{false};
     double range{0.0};
     bool has_range{false};
 };
